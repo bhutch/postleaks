@@ -1,3 +1,3 @@
-requests
+curl_cffi
 argparse
 whispers>=2.2.1

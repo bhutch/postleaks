@@ -1,122 +1,136 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import argparse
-import requests
-import sys
-import math
 import json
+import math
 import os
-from datetime import datetime
-import time
 import platform
+import sys
+import time
+
+# Try to import curl_cffi first, fall back to requests if not available
+try:
+    from curl_cffi import requests
+    CURL_CFFI_AVAILABLE = True
+    print("Using curl_cffi for HTTP requests")
+except ImportError:
+    import requests
+    CURL_CFFI_AVAILABLE = False
+    print("Warning: curl_cffi not available, falling back to standard requests library")
+
 import whispers
 
-# Requests configuration
+# Constants
 POSTMAN_HOST = "https://www.postman.com"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-HEADERS = {"User-Agent" : USER_AGENT}
-
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+HEADERS = {"User-Agent": USER_AGENT}
 REQUEST_INFO_INTERESTING_DATA = ["id", "url", "method", "auth", "queryParams", "description", "name", "events", "data", "headerData"]
-DEFAULT_OUTPUT_FOLDERNAME="results_"
 
 # Colors
-ORANGE='\033[0;35m'
-GREEN='\033[92m'
-BLUE='\033[94m'
-YELLOW='\033[33m'
-BOLD='\033[1m'
-NOCOLOR='\033[0m'
+BLUE = '\033[94m'
+ORANGE = '\033[93m'
+NOCOLOR = '\033[0m'
+
+def create_session(impersonate_browser=None):
+    """Create a requests session with optional browser impersonation"""
+    if CURL_CFFI_AVAILABLE and impersonate_browser:
+        try:
+            return requests.Session(impersonate=impersonate_browser)
+        except Exception as e:
+            print(f"Warning: Failed to create session with impersonation '{impersonate_browser}': {e}")
+            print("Falling back to regular session")
+    
+    return requests.Session()
 
 def main():
-    parser = argparse.ArgumentParser(description=BOLD+'Postleaks 🚀💧'+NOCOLOR+" Search for sensitive data in Postman public library.")
-    parser.add_argument('-k', type=str, required=False, dest='keyword', help = "Keyword (Domain, company, etc.)")
-    parser.add_argument('-kf', type=str, required=False, dest='keyword_file', help="File containing keywords (one per line)")
-    parser.add_argument('--extend-workspaces', action="store_true", default=False, required=False, dest='extend_workspaces', help = "Extend search to Postman workspaces linked to found requests (warning: request consuming and risk of false positive)")
-    parser.add_argument('--strict', action="store_true", default=False, required=False, dest='strict', help = "Only include results where keywords are in the URL (warning: could miss some results where the final URL is a variable)")
-    parser.add_argument('--include', type=str, required=False, dest='include', help = "URL should match this string")
-    parser.add_argument('--exclude', type=str, required=False, dest='exclude', help = "URL should not match this string")
-    parser.add_argument('--raw', action="store_true", default=False, required=False, dest='raw', help = "Display raw filtered results as JSON")
-    parser.add_argument('--output', type=str, required=False, dest='output', help = "Store JSON in specific output folder (Default: results_<TIMESTAMP>)")
+    parser = argparse.ArgumentParser(description='Postleaks 🚀💧 Search for sensitive data in Postman public library.')
+    parser.add_argument('-k', '--keyword', help='Keyword (Domain, company, etc.)')
+    parser.add_argument('-kf', '--keyword-file', help='File containing keywords (one per line)')
+    parser.add_argument('--extend-workspaces', action='store_true', help='Extend search to Postman workspaces linked to found requests (warning: request consuming and risk of false positive)')
+    parser.add_argument('--strict', action='store_true', help='Only include results where keywords are in the URL (warning: could miss some results where the final URL is a variable)')
+    parser.add_argument('--include', help='URL should match this string')
+    parser.add_argument('--exclude', help='URL should not match this string')
+    parser.add_argument('--raw', action='store_true', help='Display raw filtered results as JSON')
+    parser.add_argument('--output', default=f"results_{int(time.time())}", help='Store JSON in specific output folder (Default: results_<TIMESTAMP>)')
+    parser.add_argument('--impersonate-browser', default='chrome136', 
+                       help='Browser fingerprint to impersonate with curl_cffi (Default: chrome136). Supported: chrome99, chrome100, chrome101, chrome104, chrome107, chrome110, chrome116, chrome119, chrome120, chrome123, chrome124, chrome126, chrome127, chrome131, chrome136, edge99, edge101, edge122, edge127, safari15_3, safari15_5, safari17_0, safari17_2_1, safari18_0')
+    
     args = parser.parse_args()
-
+    
     if not args.keyword and not args.keyword_file:
-        parser.error("At least one of '-k' or '-kf' is required.")
-
+        parser.error("Either --keyword or --keyword-file must be specified")
+    
     keywords = []
     if args.keyword:
         keywords.append(args.keyword)
+    
     if args.keyword_file:
-        with open(args.keyword_file, 'r') as f:
-            keywords.extend([line.strip() for line in f.readlines()])
-
-    output_folder = ""
-    if args.output and len(args.output.strip()) >0:
-        output_folder = args.output
-    else:
-        timestamp = datetime.now().timestamp()
-        timestamp_str = str(int(timestamp))
-        output_folder = DEFAULT_OUTPUT_FOLDERNAME + timestamp_str;
-
+        try:
+            with open(args.keyword_file, 'r') as f:
+                keywords.extend([line.strip() for line in f if line.strip()])
+        except FileNotFoundError:
+            fail(f"Keyword file '{args.keyword_file}' not found", True)
+    
     for keyword in keywords:
-        print(BLUE+"[*] Searching for leaks related to keyword "+keyword+NOCOLOR)
-        request_infos = search(keyword, args.include, args.exclude, args.extend_workspaces, args.raw, args.strict, output_folder)
-        print(BLUE+"\n[*] "+str(len(request_infos))+" results found for keyword '"+keyword+"'. Happy (ethical) hacking!"+NOCOLOR)
+        print(f"{BLUE}[*] Searching for keyword: {keyword}{NOCOLOR}")
+        search(keyword, args.extend_workspaces, args.include, args.exclude, args.raw, args.strict, args.output, args.impersonate_browser)
 
-def search(keyword: str, include_match:str, exclude_match:str, extend_workspaces: bool, raw: bool, strict: bool, output: str):
-    print(BLUE+"[*] Looking for data in Postman.com")
-    ids = search_requests_ids(keyword)
-
-    request_ids = set()
-    workspaces_ids = set()
-
-    for i in ids:
-        key = next(iter(i.keys()))
-        request_ids.add(key)
-        
-        if extend_workspaces:
-            current_workspaces_ids = i.get(key)
-            for w in current_workspaces_ids:
-                workspaces_ids.add(w)
-
+def search(keyword: str, extend_workspaces: bool, include_match: str, exclude_match: str, raw: bool, strict: bool, output: str, impersonate_browser: str):
+    ids = search_requests_ids(keyword, impersonate_browser)
+    
     if extend_workspaces:
-        new_request_ids = search_request_ids_for_workspaces_id(workspaces_ids)
-        request_ids = request_ids.union(new_request_ids)
-
-    return search_request_info_for_request_ids(request_ids, include_match, exclude_match, raw, strict, keyword, output)
-
-def display(request_info:any, raw:bool):
-    if raw:
-        print(GREEN+str(request_info)+NOCOLOR)
-    else:
-        print(GREEN+"[+] (ID:" + request_info["id"] + ") "+ request_info["method"] +": "+BOLD+repr(request_info["url"]) + NOCOLOR, end = '')
-        print(YELLOW, end='')
-        if request_info["auth"] is not None:
-            print("\n - Authentication items: " + repr(request_info["auth"]), end='')
+        workspace_ids = set()
+        for id_item in ids:
+            for request_id, workspace_list in id_item.items():
+                workspace_ids.update(workspace_list)
         
-        if request_info["headerData"] is not None and len(request_info["headerData"]) != 0:
-            print("\n - Headers: ", end='')
-            for d in request_info["headerData"]:
-                print("[" + d["key"] + "=" + repr(d["value"]) + "]", end='')
+        additional_request_ids = search_request_ids_for_workspaces_id(workspace_ids, impersonate_browser)
+        ids.extend([{req_id: []} for req_id in additional_request_ids])
+    
+    # Extract just the request IDs
+    request_ids = set()
+    for id_item in ids:
+        request_ids.update(id_item.keys())
+    
+    search_request_info_for_request_ids(request_ids, include_match, exclude_match, raw, strict, keyword, output, impersonate_browser)
 
-        if request_info["data"] is not None and len(request_info["data"]) != 0:
-            print("\n - Misc. data items: ", end='')
-            for data in request_info["data"]:
-                if isinstance(data,dict):
-                    print("[" + data['key'] + "=" + repr(data['value']) + "]", end='')
-                elif data.startswith("["):
+def display(id: str, request_info: any, raw: bool):
+    if raw:
+        print(json.dumps(request_info, indent=2))
+        return
+    
+    print(f"{BLUE}[+] (ID:{id}) {request_info.get('method', 'UNKNOWN')}: '{request_info.get('url', 'NO_URL')}'{NOCOLOR}")
+    
+    if request_info.get("headerData"):
+        print(" - Headers: ", end='')
+        for d in request_info["headerData"]:
+            if d.get("key") and d.get("value"):
+                print(f"[{d['key']}='{d['value']}']", end='')
+    
+    if request_info.get("data"):
+        print("\n - Misc. data items: ", end='')
+        for data in request_info["data"]:
+            if isinstance(data, dict) and data.get("key") and data.get("value"):
+                print(f"[{data['key']}='{data['value']}']", end='')
+            elif isinstance(data, str) and data.startswith("["):
+                try:
                     tmp = json.loads(data)
                     for d in tmp:
-                        if len(d['key']) != 0:
-                            print("[" + d['key'] + "=" + repr(d['value']) + "]", end='')
-        
-        if request_info["queryParams"] is not None and len(request_info["queryParams"]) != 0:
-            print("\n - Query parameters: ", end='')
-            for d in request_info["queryParams"]:
-                print("[" + d["key"] + "=" + repr(d["value"]) + "]", end='')
-    print(NOCOLOR)
+                        if d.get('key'):
+                            print(f"[{d['key']}='{d.get('value', '')}']", end='')
+                except json.JSONDecodeError:
+                    pass
+    
+    if request_info.get("queryParams"):
+        print("\n - Query parameters: ", end='')
+        for d in request_info["queryParams"]:
+            if d.get("key") and d.get("value"):
+                print(f"[{d['key']}='{d['value']}']", end='')
+    
+    print(f"{NOCOLOR}")
 
-def search_request_info_for_request_ids(ids: set, include_match:str, exclude_match:str, raw: bool, strict: bool, keyword:str, output: str):
+def search_request_info_for_request_ids(ids: set, include_match:str, exclude_match:str, raw: bool, strict: bool, keyword:str, output: str, impersonate_browser: str):
     print(BLUE+"[*] Search for requests info in collection of requests"+NOCOLOR)
 
     os.makedirs(output, exist_ok=True)
@@ -125,7 +139,7 @@ def search_request_info_for_request_ids(ids: set, include_match:str, exclude_mat
 
     request_infos = []
 
-    session = requests.Session()
+    session = create_session(impersonate_browser)
     for id in ids:
         response = session.get(POSTMAN_HOST+GET_REQUEST_ENDPOINT+str(id), headers=HEADERS)
         if (response.status_code != 200):
@@ -155,8 +169,10 @@ def search_request_info_for_request_ids(ids: set, include_match:str, exclude_mat
                 continue
             else:
                 if "url" in request_info:
+                    # Override the id field with the full ID (including prefix)
+                    request_info["id"] = str(id)
                     request_infos.append(request_info)
-                    display(request_info, raw)
+                    display(str(id), request_info, raw)
                     f = store(request_info, output)
                     identify_secrets(f)
         
@@ -179,14 +195,14 @@ def store(request_info: any, output: str):
         file.write(json_string)
     return file_path
 
-def search_request_ids_for_workspaces_id(ids: set):
+def search_request_ids_for_workspaces_id(ids: set, impersonate_browser: str):
     print(BLUE+"[*] Looking for requests IDs in collection of workspaces"+NOCOLOR)
 
     LIST_COLLECTION_ENDPOINT="/_api/list/collection"
 
     request_ids = set()
 
-    session = requests.Session()
+    session = create_session(impersonate_browser)
     for id in ids:
         response = session.post(POSTMAN_HOST+LIST_COLLECTION_ENDPOINT+"?workspace="+str(id), headers=HEADERS)
         if (response.status_code == 429):
@@ -215,7 +231,7 @@ def parse_search_requests_from_workspace_response(list_collection_response):
 
         return request_ids
 
-def search_requests_ids(keyword: str):
+def search_requests_ids(keyword: str, impersonate_browser: str):
     print(BLUE+"[*] Searching for requests IDs"+NOCOLOR)
 
     # https://www.postman.com/_api/ws/proxy limitation on results (<= 25)
@@ -224,7 +240,7 @@ def search_requests_ids(keyword: str):
     MAX_OFFSET = 200
     GLOBAL_SEARCH_ENDPOINT="/_api/ws/proxy"
 
-    session = requests.Session()
+    session = create_session(impersonate_browser)
     response = session.post(POSTMAN_HOST+GLOBAL_SEARCH_ENDPOINT, json=format_search_request_body(keyword, 0, MAX_SEARCH_RESULTS), headers=HEADERS)
     if (response.status_code != 200):
         fail("Error in [search_requests_ids] on returned results from Postman.com.", True)
